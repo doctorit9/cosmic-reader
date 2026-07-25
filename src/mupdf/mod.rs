@@ -6,7 +6,7 @@ use cosmic::iced::keyboard::key::Named;
 use cosmic::iced::keyboard::{Event as KeyEvent, Key, Modifiers};
 use cosmic::iced::mouse::ScrollDelta;
 use cosmic::iced::widget::scrollable;
-use cosmic::iced::{Alignment, Color, ContentFit, Length, Rectangle, Subscription, stream, window};
+use cosmic::iced::{Alignment, ContentFit, Length, Rectangle, Subscription, stream, window};
 use cosmic::widget::nav_bar::Model;
 use cosmic::widget::segmented_button::Entity;
 use cosmic::widget::{self};
@@ -14,12 +14,28 @@ use cosmic::{Application, Element, action, cosmic_theme, executor, theme};
 use rayon::prelude::*;
 use std::any::TypeId;
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fmt, hash, process};
 
 use crate::fl;
 
 const THUMBNAIL_WIDTH: u16 = 128;
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+    if unit_idx == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit_idx])
+    }
+}
 
 mod argparse;
 mod thumbnail;
@@ -94,6 +110,7 @@ struct Page {
 #[derive(Clone, Debug)]
 enum Message {
     DisplayList(i32, Arc<mupdf::DisplayList>),
+    DocumentMeta(DocumentMeta),
     FileLoad(url::Url),
     FileOpen,
     Fullscreen,
@@ -102,6 +119,8 @@ enum Message {
     NavScroll(scrollable::Viewport),
     NavSelect(Entity),
     Pages(Vec<Page>),
+    PdfBackgroundChange(usize),
+    PropertiesToggle,
     SearchActivate,
     SearchClear,
     SearchInput(String),
@@ -110,6 +129,69 @@ enum Message {
     Thumbnail(Entity, widget::image::Handle),
     ZoomDropdown(usize),
     ZoomScroll(ScrollDelta),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PdfBackground {
+    SystemTheme,
+    Dark,
+    Light,
+    White,
+    Custom { r: u8, g: u8, b: u8 },
+}
+
+impl PdfBackground {
+    fn to_color(self, is_dark: bool) -> cosmic::iced::Color {
+        match self {
+            PdfBackground::SystemTheme => {
+                if is_dark {
+                    cosmic::iced::Color::from_rgb(0.1, 0.1, 0.1)
+                } else {
+                    cosmic::iced::Color::from_rgb(1.0, 1.0, 1.0)
+                }
+            }
+            PdfBackground::Dark => cosmic::iced::Color::from_rgb(0.1, 0.1, 0.1),
+            PdfBackground::Light => cosmic::iced::Color::from_rgb(1.0, 1.0, 1.0),
+            PdfBackground::White => cosmic::iced::Color::from_rgb(1.0, 1.0, 1.0),
+            PdfBackground::Custom { r, g, b } => {
+                cosmic::iced::Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+            }
+        }
+    }
+
+    fn all() -> &'static [Self] {
+        &[
+            PdfBackground::SystemTheme,
+            PdfBackground::Dark,
+            PdfBackground::Light,
+            PdfBackground::White,
+        ]
+    }
+
+    fn resolve(&self, is_dark: bool) -> Self {
+        match self {
+            PdfBackground::SystemTheme => {
+                if is_dark {
+                    PdfBackground::Dark
+                } else {
+                    PdfBackground::Light
+                }
+            }
+            other => *other,
+        }
+    }
+}
+
+impl fmt::Display for PdfBackground {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            PdfBackground::SystemTheme => write!(f, "System"),
+            PdfBackground::Dark => write!(f, "Dark"),
+            PdfBackground::Light => write!(f, "Light"),
+            PdfBackground::White => write!(f, "White"),
+            PdfBackground::Custom { .. } => write!(f, "Custom"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +244,18 @@ impl fmt::Display for Zoom {
     }
 }
 
+#[derive(Clone, Debug)]
+struct DocumentMeta {
+    title: Option<String>,
+    author: Option<String>,
+    subject: Option<String>,
+    creator: Option<String>,
+    producer: Option<String>,
+    page_count: i32,
+    file_path: PathBuf,
+    file_size: u64,
+}
+
 struct App {
     core: Core,
     flags: Flags,
@@ -170,6 +264,10 @@ struct App {
     nav_model: Model,
     nav_scroll_id: widget::Id,
     nav_viewport: Option<scrollable::Viewport>,
+    pdf_background: PdfBackground,
+    pdf_background_names: Vec<String>,
+    properties_open: bool,
+    document_meta: Option<DocumentMeta>,
     search_active: bool,
     search_id: widget::Id,
     search_term: String,
@@ -189,6 +287,83 @@ impl App {
             }
         }
         None
+    }
+
+    fn properties_view(&self) -> Element<'_, Message> {
+        let spacing = theme::spacing();
+
+        let mut rows = widget::column::with_capacity(8)
+            .spacing(spacing.space_m)
+            .padding(spacing.space_l);
+
+        if let Some(meta) = &self.document_meta {
+            // File info section
+            rows = rows.push(
+                widget::column::with_capacity(2)
+                    .spacing(spacing.space_xxs)
+                    .push(widget::text::title4("File"))
+                    .push(
+                        widget::column::with_capacity(2)
+                            .spacing(spacing.space_xxs)
+                            .push(self.prop_row("Path", &meta.file_path.to_string_lossy()))
+                            .push(self.prop_row(
+                                "Size",
+                                &format_size(meta.file_size),
+                            )),
+                    ),
+            );
+
+            // Document info section
+            let mut doc_info = widget::column::with_capacity(6).spacing(spacing.space_xxs);
+            if let Some(title) = &meta.title {
+                doc_info = doc_info.push(self.prop_row("Title", title));
+            }
+            if let Some(author) = &meta.author {
+                doc_info = doc_info.push(self.prop_row("Author", author));
+            }
+            if let Some(subject) = &meta.subject {
+                doc_info = doc_info.push(self.prop_row("Subject", subject));
+            }
+            if let Some(creator) = &meta.creator {
+                doc_info = doc_info.push(self.prop_row("Creator", creator));
+            }
+            if let Some(producer) = &meta.producer {
+                doc_info = doc_info.push(self.prop_row("Producer", producer));
+            }
+            doc_info = doc_info.push(self.prop_row("Pages", &meta.page_count.to_string()));
+
+            rows = rows.push(
+                widget::column::with_capacity(2)
+                    .spacing(spacing.space_xxs)
+                    .push(widget::text::title4("Document"))
+                    .push(doc_info),
+            );
+        } else {
+            rows = rows.push(widget::text::body("No document loaded."));
+        }
+
+        // Close button
+        rows = rows.push(
+            widget::container(
+                widget::button::standard("Close").on_press(Message::PropertiesToggle),
+            )
+            .align_x(Alignment::End),
+        );
+
+        widget::container(rows)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(spacing.space_l)
+            .into()
+    }
+
+    fn prop_row(&self, label: &str, value: &str) -> Element<'_, Message> {
+        let spacing = theme::spacing();
+        widget::row::with_capacity(2)
+            .spacing(spacing.space_s)
+            .push(widget::text::caption(format!("{}:", label)))
+            .push(widget::text::body(value.to_owned()))
+            .into()
     }
 
     fn update_page(&mut self) -> Task<Message> {
@@ -286,6 +461,16 @@ impl Application for App {
 
     fn header_end(&self) -> Vec<Element<'_, Message>> {
         vec![
+            widget::button::icon(widget::icon::from_name("document-properties-symbolic"))
+                .on_press(Message::PropertiesToggle)
+                .padding(theme::spacing().space_xxs)
+                .into(),
+            widget::dropdown(
+                &self.pdf_background_names,
+                PdfBackground::all().iter().position(|bg| bg == &self.pdf_background),
+                Message::PdfBackgroundChange,
+            )
+            .into(),
             widget::dropdown(
                 &self.zoom_names,
                 Zoom::all().iter().position(|zoom| zoom == &self.zoom),
@@ -301,15 +486,25 @@ impl Application for App {
             zoom_names.push(zoom.to_string());
         }
 
+        let mut pdf_background_names = Vec::new();
+        for bg in PdfBackground::all() {
+            pdf_background_names.push(bg.to_string());
+        }
+
+        let core = core;
+
         let mut app = Self {
             core,
-            //TODO: what is the best value to use?
             flags,
             fullscreen: false,
             modifiers: Modifiers::default(),
             nav_model: Model::default(),
             nav_scroll_id: widget::Id::unique(),
             nav_viewport: None,
+            pdf_background: PdfBackground::SystemTheme,
+            pdf_background_names,
+            properties_open: false,
+            document_meta: None,
             search_active: false,
             search_id: widget::Id::unique(),
             search_term: String::new(),
@@ -320,6 +515,17 @@ impl Application for App {
         };
         let task = app.update_page();
         (app, task)
+    }
+
+    fn system_theme_mode_update(
+        &mut self,
+        _keys: &[&'static str],
+        _new_theme: &cosmic_theme::ThemeMode,
+    ) -> Task<Message> {
+        if self.pdf_background == PdfBackground::SystemTheme {
+            return self.update_page();
+        }
+        Task::none()
     }
 
     fn nav_bar(&self) -> Option<Element<'_, action::Action<Message>>> {
@@ -426,9 +632,14 @@ impl Application for App {
                     return Task::batch(tasks);
                 }
             }
+            Message::DocumentMeta(meta) => {
+                self.document_meta = Some(meta);
+            }
             Message::FileLoad(url) => {
                 self.nav_model.clear();
                 self.flags.url_opt = Some(url);
+                self.document_meta = None;
+                self.properties_open = false;
             }
             Message::FileOpen => {
                 #[cfg(feature = "xdg-portal")]
@@ -494,7 +705,6 @@ impl Application for App {
                 Key::Character(c) => match c.as_str() {
                     "0" => {
                         self.zoom = Zoom::Percent(100);
-                        println!("{:?}", self.zoom)
                     }
                     "-" => {
                         let percent = match self.zoom {
@@ -502,7 +712,6 @@ impl Application for App {
                             _ => ((self.view_ratio.get() * 4.0).round() as i16) * 25,
                         };
                         self.zoom = Zoom::Percent((percent - 25).clamp(25, 500));
-                        println!("{:?}", self.zoom)
                     }
                     "=" => {
                         let percent = match self.zoom {
@@ -510,7 +719,6 @@ impl Application for App {
                             _ => ((self.view_ratio.get() * 4.0).round() as i16) * 25,
                         };
                         self.zoom = Zoom::Percent((percent + 25).clamp(25, 500));
-                        println!("{:?}", self.zoom)
                     }
                     "f" => {
                         self.zoom = Zoom::FitBoth;
@@ -546,6 +754,9 @@ impl Application for App {
                 self.nav_model.activate_position(0);
                 return self.update_page();
             }
+            Message::PropertiesToggle => {
+                self.properties_open = !self.properties_open;
+            }
             Message::SearchActivate => {
                 self.search_active = true;
                 return widget::text_input::focus(self.search_id.clone());
@@ -556,7 +767,7 @@ impl Application for App {
             Message::SearchInput(term) => {
                 self.search_term = term.clone();
             }
-            Message::SearchResults(entity, quads) => {
+            Message::SearchResults(_entity, _quads) => {
                 //TODO
             }
             Message::Svg(entity, handle) => {
@@ -567,6 +778,11 @@ impl Application for App {
             Message::Thumbnail(entity, handle) => {
                 if let Some(page) = self.nav_model.data_mut::<Page>(entity) {
                     page.icon_handle = Some(handle);
+                }
+            }
+            Message::PdfBackgroundChange(index) => {
+                if let Some(bg) = PdfBackground::all().get(index) {
+                    self.pdf_background = *bg;
                 }
             }
             Message::ZoomDropdown(index) => {
@@ -593,7 +809,6 @@ impl Application for App {
                     self.zoom_scroll += 1.0;
                 }
                 self.zoom = Zoom::Percent(percent.clamp(25, 500));
-                println!("{}", self.zoom);
             }
         }
         Task::none()
@@ -602,23 +817,35 @@ impl Application for App {
     fn view(&self) -> Element<'_, Message> {
         let entity = self.nav_model.active();
 
+        if self.properties_open {
+            return self.properties_view();
+        }
+
         // Handle cached images
         if let Some(page) = self.nav_model.data::<Page>(entity) {
+            let pdf_background = self.pdf_background;
+            let zoom = self.zoom;
+            let page_bounds = page.bounds;
+            let svg_handle = page.svg_handle.clone();
+            let view_ratio = self.view_ratio.clone();
+            let is_dark = theme::is_dark();
+            
             return widget::responsive(move |size| {
-                let ratio = match self.zoom {
-                    Zoom::FitHeight => size.height / page.bounds.height(),
-                    Zoom::FitWidth => size.width / page.bounds.width(),
+                let ratio = match zoom {
+                    Zoom::FitHeight => size.height / page_bounds.height(),
+                    Zoom::FitWidth => size.width / page_bounds.width(),
                     Zoom::FitBoth => {
-                        (size.width / page.bounds.width()).min(size.height / page.bounds.height())
+                        (size.width / page_bounds.width()).min(size.height / page_bounds.height())
                     }
                     //TODO: adjust ratio by DPI
                     Zoom::Percent(percent) => (percent as f32) / 100.0,
                 };
-                self.view_ratio.set(ratio);
-                let width = page.bounds.width() * ratio;
-                let height = page.bounds.height() * ratio;
+                view_ratio.set(ratio);
+                let width = page_bounds.width() * ratio;
+                let height = page_bounds.height() * ratio;
+                let bg_color = pdf_background.to_color(is_dark);
                 let mut container = widget::container(
-                    widget::container(if let Some(handle) = &page.svg_handle {
+                    widget::container(if let Some(handle) = &svg_handle {
                         Element::from(
                             widget::svg(handle.clone())
                                 .content_fit(ContentFit::Fill)
@@ -628,7 +855,7 @@ impl Application for App {
                     } else {
                         Element::from(widget::space().width(width).height(height))
                     })
-                    .style(|_theme| widget::container::background(Color::WHITE)),
+                    .style(move |_theme| widget::container::background(bg_color)),
                 );
                 if size.width > width {
                     container = container.center_x(size.width);
@@ -652,7 +879,6 @@ impl Application for App {
         }
 
         if self.flags.url_opt.is_none() {
-            //TODO: use space variables
             let column = widget::column::with_capacity(4)
                 .align_x(Alignment::Center)
                 .spacing(24)
@@ -711,7 +937,36 @@ impl Application for App {
                                 let Ok(path) = url.to_file_path() else { return };
                                 let doc = mupdf::Document::open(path.as_os_str()).unwrap();
                                 let page_count = doc.page_count().unwrap();
-                                //TODO: use outline for document tree view eprintln!("{:#?}", doc.outlines());
+
+                                let file_size = std::fs::metadata(&path)
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+
+                                let meta = DocumentMeta {
+                                    title: doc.metadata(mupdf::MetadataName::Title).ok().and_then(|t| {
+                                        if t.is_empty() { None } else { Some(t) }
+                                    }),
+                                    author: doc.metadata(mupdf::MetadataName::Author).ok().and_then(|t| {
+                                        if t.is_empty() { None } else { Some(t) }
+                                    }),
+                                    subject: doc.metadata(mupdf::MetadataName::Subject).ok().and_then(|t| {
+                                        if t.is_empty() { None } else { Some(t) }
+                                    }),
+                                    creator: doc.metadata(mupdf::MetadataName::Creator).ok().and_then(|t| {
+                                        if t.is_empty() { None } else { Some(t) }
+                                    }),
+                                    producer: doc.metadata(mupdf::MetadataName::Producer).ok().and_then(|t| {
+                                        if t.is_empty() { None } else { Some(t) }
+                                    }),
+                                    page_count,
+                                    file_path: path.clone(),
+                                    file_size,
+                                };
+                                handle
+                                    .block_on(async {
+                                        output.send(Message::DocumentMeta(meta)).await
+                                    })
+                                    .unwrap();
 
                                 // Generate the table of contents
                                 let mut pages =
@@ -797,11 +1052,10 @@ impl Application for App {
                             let output = Arc::new(tokio::sync::Mutex::new(output));
                             let handle = tokio::runtime::Handle::current();
                             tokio::task::spawn_blocking(move || {
-                                let timer = std::time::Instant::now();
+                                let _timer = std::time::Instant::now();
                                 display_lists.par_iter().for_each(|(entity, display_list)| {
                                     let quads = display_list.search(&term, 100).unwrap();
                                     if !quads.is_empty() {
-                                        eprintln!("{:?}: {:?} results", entity, quads.len(),);
                                         let quads_vec: Vec<mupdf::Quad> =
                                             quads.into_iter().collect();
                                         let output = output.clone();
@@ -817,8 +1071,7 @@ impl Application for App {
                                             })
                                             .unwrap();
                                     }
-                                });
-                                eprintln!("searched for {:?} in {:?}", term, timer.elapsed());
+                                })
                             })
                             .await
                             .unwrap();

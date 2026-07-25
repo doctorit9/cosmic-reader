@@ -140,7 +140,7 @@ impl canvas::Program<Message, Theme, Renderer> for App {
         &self,
         state: &Self::State,
         renderer: &Renderer,
-        _theme: &Theme,
+        theme: &Theme,
         bounds: Rectangle,
         _cursor: Cursor,
     ) -> Vec<widget::canvas::Geometry> {
@@ -183,8 +183,9 @@ impl canvas::Program<Message, Theme, Renderer> for App {
                         -rect.size().width / 2.0,
                         -rect.size().height / 2.0,
                     ));
-                    // Fill background
-                    frame.fill_rectangle(rect.position(), rect.size(), Color::WHITE);
+                    // Fill background with theme-aware color
+                    let bg_color = cosmic::iced::Color::from(theme.cosmic().bg_color());
+                    frame.fill_rectangle(rect.position(), rect.size(), bg_color);
                 }
 
                 {

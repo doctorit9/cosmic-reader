@@ -28,7 +28,7 @@ rust-embed = "8"
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"
 default-features = false
-features = ["tokio", "winit"]
+features = ["tokio", "winit", "wayland", "dbus-config"]
 
 # For lopdf feature
 [dependencies.lopdf]
@@ -44,10 +44,12 @@ optional = true
 fork = "0.7"
 
 [features]
-default = ["mupdf", "sys-lib", "xdg-portal", "wgpu"]
+default = ["mupdf", "sys-lib", "xdg-portal", "wgpu", "wayland", "dbus-config"]
 sys-lib = ["mupdf?/sys-lib"]
 xdg-portal = ["libcosmic/xdg-portal"]
 wgpu = ["libcosmic/wgpu"]
+wayland = ["libcosmic/wayland"]
+dbus-config = ["libcosmic/dbus-config"]
 
 [profile.release-with-debug]
 inherits = "release"
