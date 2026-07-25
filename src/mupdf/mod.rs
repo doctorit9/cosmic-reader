@@ -4,7 +4,7 @@ use cosmic::iced::event::{self, Event};
 use cosmic::iced::futures::{self, SinkExt};
 use cosmic::iced::keyboard::key::Named;
 use cosmic::iced::keyboard::{Event as KeyEvent, Key, Modifiers};
-use cosmic::iced::mouse::ScrollDelta;
+use cosmic::iced::mouse::{self, Button, ScrollDelta};
 use cosmic::iced::widget::scrollable;
 use cosmic::iced::{Alignment, ContentFit, Length, Rectangle, Subscription, stream, window};
 use cosmic::widget::nav_bar::Model;
@@ -21,6 +21,23 @@ use std::{fmt, hash, process};
 use crate::fl;
 
 const THUMBNAIL_WIDTH: u16 = 128;
+
+fn display_list_to_inverted_image(display_list: &mupdf::DisplayList, scale: f32) -> widget::image::Handle {
+    let matrix = mupdf::Matrix::new_scale(scale, scale);
+    let mut pixmap = display_list
+        .to_pixmap(&matrix, &mupdf::Colorspace::device_rgb(), false)
+        .unwrap();
+    let samples = pixmap.samples_mut();
+    // Invert RGB channels, keep alpha
+    for chunk in samples.chunks_exact_mut(4) {
+        chunk[0] = 255 - chunk[0];
+        chunk[1] = 255 - chunk[1];
+        chunk[2] = 255 - chunk[2];
+    }
+    let mut data = Vec::new();
+    pixmap.write_to(&mut data, mupdf::ImageFormat::PNG).unwrap();
+    widget::image::Handle::from_bytes(data)
+}
 
 fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
@@ -104,17 +121,22 @@ struct Page {
     display_list: Option<Arc<mupdf::DisplayList>>,
     icon_bounds: Cell<Option<Rectangle>>,
     icon_handle: Option<widget::image::Handle>,
+    inverted_image_handle: Option<widget::image::Handle>,
     svg_handle: Option<widget::svg::Handle>,
 }
 
 #[derive(Clone, Debug)]
 enum Message {
+    ContentScroll(scrollable::Viewport),
     DisplayList(i32, Arc<mupdf::DisplayList>),
     DocumentMeta(DocumentMeta),
     FileLoad(url::Url),
     FileOpen,
     Fullscreen,
     Key(Modifiers, Key, Option<SmolStr>),
+    MiddleDragRelease,
+    MiddleDragStart(cosmic::iced::Point),
+    MiddleDragMove(cosmic::iced::Point),
     ModifiersChanged(Modifiers),
     NavScroll(scrollable::Viewport),
     NavSelect(Entity),
@@ -127,7 +149,7 @@ enum Message {
     SearchClear,
     SearchInput(String),
     SearchResults(Entity, Vec<mupdf::Quad>),
-    Svg(Entity, widget::svg::Handle),
+    Svg(Entity, widget::svg::Handle, widget::image::Handle),
     Thumbnail(Entity, widget::image::Handle),
     ZoomDropdown(usize),
     ZoomScroll(ScrollDelta),
@@ -161,12 +183,21 @@ impl PdfBackground {
         }
     }
 
+    /// Whether this background mode inverts PDF content colors for dark reading.
+    fn inverts_content(self, is_dark: bool) -> bool {
+        match self {
+            PdfBackground::SystemTheme => is_dark,
+            PdfBackground::Dark => true,
+            _ => false,
+        }
+    }
+
     fn all() -> &'static [Self] {
         &[
             PdfBackground::SystemTheme,
-            PdfBackground::Dark,
-            PdfBackground::Light,
             PdfBackground::White,
+            PdfBackground::Light,
+            PdfBackground::Dark,
         ]
     }
 
@@ -259,9 +290,12 @@ struct DocumentMeta {
 }
 
 struct App {
+    content_scroll_id: widget::Id,
+    content_viewport: Option<scrollable::Viewport>,
     core: Core,
     flags: Flags,
     fullscreen: bool,
+    middle_drag_pos: Option<cosmic::iced::Point>,
     modifiers: Modifiers,
     natural_scroll: bool,
     nav_model: Model,
@@ -407,7 +441,12 @@ impl App {
                 async move {
                     tokio::task::spawn_blocking(move || {
                         let svg = display_list.to_svg(&mupdf::Matrix::IDENTITY).unwrap();
-                        Message::Svg(entity, widget::svg::Handle::from_memory(svg.into_bytes()))
+                        let inverted = display_list_to_inverted_image(&display_list, 2.0);
+                        Message::Svg(
+                            entity,
+                            widget::svg::Handle::from_memory(svg.into_bytes()),
+                            inverted,
+                        )
                     })
                     .await
                     .unwrap()
@@ -494,9 +533,12 @@ impl Application for App {
         let core = core;
 
         let mut app = Self {
+            content_scroll_id: widget::Id::unique(),
+            content_viewport: None,
             core,
             flags,
             fullscreen: false,
+            middle_drag_pos: None,
             modifiers: Modifiers::default(),
             natural_scroll: true,
             nav_model: Model::default(),
@@ -607,6 +649,9 @@ impl Application for App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ContentScroll(viewport) => {
+                self.content_viewport = Some(viewport);
+            }
             Message::DisplayList(index, display_list) => {
                 if let Some(entity) = self.entity_by_index(index) {
                     let mut tasks = Vec::with_capacity(2);
@@ -675,6 +720,27 @@ impl Application for App {
                         },
                     );
                 }
+            }
+            Message::MiddleDragStart(pos) => {
+                self.middle_drag_pos = Some(pos);
+            }
+            Message::MiddleDragMove(pos) => {
+                if let Some(last_pos) = self.middle_drag_pos.take() {
+                    let offset = self.content_viewport.as_ref().map(|v| v.absolute_offset()).unwrap_or_default();
+                    let new_x = (offset.x as f32 + last_pos.x - pos.x).max(0.0);
+                    let new_y = (offset.y as f32 + last_pos.y - pos.y).max(0.0);
+                    self.middle_drag_pos = Some(pos);
+                    return scrollable::scroll_to(
+                        self.content_scroll_id.clone(),
+                        scrollable::AbsoluteOffset {
+                            x: Some(new_x),
+                            y: Some(new_y),
+                        },
+                    );
+                }
+            }
+            Message::MiddleDragRelease => {
+                self.middle_drag_pos = None;
             }
             //TODO: move to key binds and set up menu
             Message::Key(_modifiers, key, _text) => match &key {
@@ -772,9 +838,10 @@ impl Application for App {
             Message::SearchResults(_entity, _quads) => {
                 //TODO
             }
-            Message::Svg(entity, handle) => {
+            Message::Svg(entity, svg_handle, inverted_image_handle) => {
                 if let Some(page) = self.nav_model.data_mut::<Page>(entity) {
-                    page.svg_handle = Some(handle);
+                    page.svg_handle = Some(svg_handle);
+                    page.inverted_image_handle = Some(inverted_image_handle);
                 }
             }
             Message::Thumbnail(entity, handle) => {
@@ -796,11 +863,6 @@ impl Application for App {
                 let scroll_amount = match delta {
                     ScrollDelta::Lines { y, .. } => y,
                     ScrollDelta::Pixels { y, .. } => y / 20.0,
-                };
-                let scroll_amount = if self.natural_scroll {
-                    -scroll_amount
-                } else {
-                    scroll_amount
                 };
                 self.zoom_scroll += scroll_amount;
                 let mut percent = match self.zoom {
@@ -871,8 +933,10 @@ impl Application for App {
             let zoom = self.zoom;
             let page_bounds = page.bounds;
             let svg_handle = page.svg_handle.clone();
+            let inverted_image_handle = page.inverted_image_handle.clone();
             let view_ratio = self.view_ratio.clone();
             let is_dark = theme::is_dark();
+            let use_inverted = pdf_background.inverts_content(is_dark);
             
             return widget::responsive(move |size| {
                 let ratio = match zoom {
@@ -881,25 +945,35 @@ impl Application for App {
                     Zoom::FitBoth => {
                         (size.width / page_bounds.width()).min(size.height / page_bounds.height())
                     }
-                    //TODO: adjust ratio by DPI
                     Zoom::Percent(percent) => (percent as f32) / 100.0,
                 };
                 view_ratio.set(ratio);
                 let width = page_bounds.width() * ratio;
                 let height = page_bounds.height() * ratio;
                 let bg_color = pdf_background.to_color(is_dark);
-                let mut container = widget::container(
-                    widget::container(if let Some(handle) = &svg_handle {
+                let content: Element<'_, Message> = if use_inverted {
+                    if let Some(handle) = &inverted_image_handle {
                         Element::from(
-                            widget::svg(handle.clone())
-                                .content_fit(ContentFit::Fill)
+                            widget::image(handle.clone())
                                 .width(width)
                                 .height(height),
                         )
                     } else {
                         Element::from(widget::space().width(width).height(height))
-                    })
-                    .style(move |_theme| widget::container::background(bg_color)),
+                    }
+                } else if let Some(handle) = &svg_handle {
+                    Element::from(
+                        widget::svg(handle.clone())
+                            .content_fit(ContentFit::Fill)
+                            .width(width)
+                            .height(height),
+                    )
+                } else {
+                    Element::from(widget::space().width(width).height(height))
+                };
+                let mut container = widget::container(
+                    widget::container(content)
+                        .style(move |_theme| widget::container::background(bg_color)),
                 );
                 if size.width > width {
                     container = container.center_x(size.width);
@@ -908,18 +982,21 @@ impl Application for App {
                     container = container.center_y(size.height);
                 }
                 let mut mouse_area =
-                    widget::mouse_area(container).on_double_press(Message::Fullscreen);
+                    widget::mouse_area(container)
+                        .on_double_press(Message::Fullscreen);
                 if self.modifiers.contains(Modifiers::CTRL) {
                     mouse_area = mouse_area.on_scroll(Message::ZoomScroll);
                 } else {
                     mouse_area = mouse_area.on_scroll(Message::PageScroll);
                 }
-                scrollable(mouse_area)
+                let content = scrollable(mouse_area)
+                    .id(self.content_scroll_id.clone())
+                    .on_scroll(Message::ContentScroll)
                     .direction(scrollable::Direction::Both {
                         vertical: Default::default(),
                         horizontal: Default::default(),
-                    })
-                    .into()
+                    });
+                content.into()
             })
             .into();
         }
@@ -963,6 +1040,15 @@ impl Application for App {
                 },
                 Event::Keyboard(KeyEvent::ModifiersChanged(modifiers)) => {
                     Some(Message::ModifiersChanged(modifiers))
+                }
+                Event::Mouse(mouse::Event::ButtonPressed(Button::Middle)) => {
+                    Some(Message::MiddleDragStart(Default::default()))
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(Button::Middle)) => {
+                    Some(Message::MiddleDragRelease)
+                }
+                Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                    Some(Message::MiddleDragMove(position))
                 }
                 _ => None,
             },
@@ -1027,6 +1113,7 @@ impl Application for App {
                                         display_list: None,
                                         icon_bounds: Cell::new(None),
                                         icon_handle: None,
+                                        inverted_image_handle: None,
                                         svg_handle: None,
                                     });
                                 }
