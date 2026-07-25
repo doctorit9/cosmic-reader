@@ -118,6 +118,8 @@ enum Message {
     ModifiersChanged(Modifiers),
     NavScroll(scrollable::Viewport),
     NavSelect(Entity),
+    NaturalScrollToggle,
+    PageScroll(ScrollDelta),
     Pages(Vec<Page>),
     PdfBackgroundChange(usize),
     PropertiesToggle,
@@ -261,9 +263,11 @@ struct App {
     flags: Flags,
     fullscreen: bool,
     modifiers: Modifiers,
+    natural_scroll: bool,
     nav_model: Model,
     nav_scroll_id: widget::Id,
     nav_viewport: Option<scrollable::Viewport>,
+    page_scroll: f32,
     pdf_background: PdfBackground,
     pdf_background_names: Vec<String>,
     properties_open: bool,
@@ -290,79 +294,75 @@ impl App {
     }
 
     fn properties_view(&self) -> Element<'_, Message> {
-        let spacing = theme::spacing();
-
-        let mut rows = widget::column::with_capacity(8)
-            .spacing(spacing.space_m)
-            .padding(spacing.space_l);
+        let mut sections = Vec::new();
 
         if let Some(meta) = &self.document_meta {
-            // File info section
-            rows = rows.push(
-                widget::column::with_capacity(2)
-                    .spacing(spacing.space_xxs)
-                    .push(widget::text::title4("File"))
-                    .push(
-                        widget::column::with_capacity(2)
-                            .spacing(spacing.space_xxs)
-                            .push(self.prop_row("Path", &meta.file_path.to_string_lossy()))
-                            .push(self.prop_row(
-                                "Size",
-                                &format_size(meta.file_size),
-                            )),
-                    ),
+            sections.push(
+                widget::settings::section()
+                    .title("File")
+                    .add(widget::settings::item(
+                        "Path",
+                        widget::text::body(meta.file_path.to_string_lossy().to_string()),
+                    ))
+                    .add(widget::settings::item(
+                        "Size",
+                        widget::text::body(format_size(meta.file_size)),
+                    ))
+                    .into(),
             );
 
-            // Document info section
-            let mut doc_info = widget::column::with_capacity(6).spacing(spacing.space_xxs);
+            let mut doc_section = widget::settings::section().title("Document");
+            doc_section = doc_section.add(widget::settings::item(
+                "Pages",
+                widget::text::body(meta.page_count.to_string()),
+            ));
             if let Some(title) = &meta.title {
-                doc_info = doc_info.push(self.prop_row("Title", title));
+                doc_section = doc_section.add(widget::settings::item(
+                    "Title",
+                    widget::text::body(title.clone()),
+                ));
             }
             if let Some(author) = &meta.author {
-                doc_info = doc_info.push(self.prop_row("Author", author));
+                doc_section = doc_section.add(widget::settings::item(
+                    "Author",
+                    widget::text::body(author.clone()),
+                ));
             }
             if let Some(subject) = &meta.subject {
-                doc_info = doc_info.push(self.prop_row("Subject", subject));
+                doc_section = doc_section.add(widget::settings::item(
+                    "Subject",
+                    widget::text::body(subject.clone()),
+                ));
             }
             if let Some(creator) = &meta.creator {
-                doc_info = doc_info.push(self.prop_row("Creator", creator));
+                doc_section = doc_section.add(widget::settings::item(
+                    "Creator",
+                    widget::text::body(creator.clone()),
+                ));
             }
             if let Some(producer) = &meta.producer {
-                doc_info = doc_info.push(self.prop_row("Producer", producer));
+                doc_section = doc_section.add(widget::settings::item(
+                    "Producer",
+                    widget::text::body(producer.clone()),
+                ));
             }
-            doc_info = doc_info.push(self.prop_row("Pages", &meta.page_count.to_string()));
-
-            rows = rows.push(
-                widget::column::with_capacity(2)
-                    .spacing(spacing.space_xxs)
-                    .push(widget::text::title4("Document"))
-                    .push(doc_info),
-            );
-        } else {
-            rows = rows.push(widget::text::body("No document loaded."));
+            sections.push(doc_section.into());
         }
 
-        // Close button
-        rows = rows.push(
-            widget::container(
-                widget::button::standard("Close").on_press(Message::PropertiesToggle),
-            )
-            .align_x(Alignment::End),
+        sections.push(
+            widget::settings::section()
+                .title("Settings")
+                .add(widget::settings::item(
+                    "Natural scrolling",
+                    widget::toggler(self.natural_scroll)
+                        .on_toggle(|_| Message::NaturalScrollToggle),
+                ))
+                .into(),
         );
 
-        widget::container(rows)
+        widget::settings::view_column(sections)
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(spacing.space_l)
-            .into()
-    }
-
-    fn prop_row(&self, label: &str, value: &str) -> Element<'_, Message> {
-        let spacing = theme::spacing();
-        widget::row::with_capacity(2)
-            .spacing(spacing.space_s)
-            .push(widget::text::caption(format!("{}:", label)))
-            .push(widget::text::body(value.to_owned()))
             .into()
     }
 
@@ -498,9 +498,11 @@ impl Application for App {
             flags,
             fullscreen: false,
             modifiers: Modifiers::default(),
+            natural_scroll: true,
             nav_model: Model::default(),
             nav_scroll_id: widget::Id::unique(),
             nav_viewport: None,
+            page_scroll: 0.0,
             pdf_background: PdfBackground::SystemTheme,
             pdf_background_names,
             properties_open: false,
@@ -791,11 +793,16 @@ impl Application for App {
                 }
             }
             Message::ZoomScroll(delta) => {
-                self.zoom_scroll += match delta {
+                let scroll_amount = match delta {
                     ScrollDelta::Lines { y, .. } => y,
-                    //TODO: best pixel to line conversion ratio?
                     ScrollDelta::Pixels { y, .. } => y / 20.0,
                 };
+                let scroll_amount = if self.natural_scroll {
+                    -scroll_amount
+                } else {
+                    scroll_amount
+                };
+                self.zoom_scroll += scroll_amount;
                 let mut percent = match self.zoom {
                     Zoom::Percent(percent) => percent,
                     _ => ((self.view_ratio.get() * 4.0).round() as i16) * 25,
@@ -809,6 +816,43 @@ impl Application for App {
                     self.zoom_scroll += 1.0;
                 }
                 self.zoom = Zoom::Percent(percent.clamp(25, 500));
+            }
+            Message::NaturalScrollToggle => {
+                self.natural_scroll = !self.natural_scroll;
+            }
+            Message::PageScroll(delta) => {
+                let scroll_amount = match delta {
+                    ScrollDelta::Lines { y, .. } => y / 3.0,
+                    ScrollDelta::Pixels { y, .. } => y / 60.0,
+                };
+                let scroll_amount = if self.natural_scroll {
+                    -scroll_amount
+                } else {
+                    scroll_amount
+                };
+                self.page_scroll += scroll_amount;
+                while self.page_scroll >= 1.0 {
+                    self.page_scroll -= 1.0;
+                    let pos = self
+                        .nav_model
+                        .position(self.nav_model.active())
+                        .unwrap_or(0);
+                    if let Some(new_pos) = pos.checked_add(1) {
+                        self.nav_model.activate_position(new_pos);
+                        return self.update_page();
+                    }
+                }
+                while self.page_scroll <= -1.0 {
+                    self.page_scroll += 1.0;
+                    let pos = self
+                        .nav_model
+                        .position(self.nav_model.active())
+                        .unwrap_or(0);
+                    if let Some(new_pos) = pos.checked_sub(1) {
+                        self.nav_model.activate_position(new_pos);
+                        return self.update_page();
+                    }
+                }
             }
         }
         Task::none()
@@ -867,6 +911,8 @@ impl Application for App {
                     widget::mouse_area(container).on_double_press(Message::Fullscreen);
                 if self.modifiers.contains(Modifiers::CTRL) {
                     mouse_area = mouse_area.on_scroll(Message::ZoomScroll);
+                } else {
+                    mouse_area = mouse_area.on_scroll(Message::PageScroll);
                 }
                 scrollable(mouse_area)
                     .direction(scrollable::Direction::Both {
