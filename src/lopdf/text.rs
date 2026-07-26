@@ -43,7 +43,7 @@ impl Text {
             &self.content,
             cosmic_text::LineEnding::default(),
             cosmic_text::AttrsList::new(&self.attrs.as_attrs()),
-            text::to_shaping(self.shaping),
+            text::to_shaping(self.shaping, &self.content),
         );
 
         let layout = buffer.layout(

@@ -31,7 +31,7 @@ impl core::fmt::Display for LoadError {
         match self {
             LoadError::MalformedFont => write!(f, "malformed font"),
             LoadError::UnnamedFont => write!(f, "font doesn't have a family name"),
-            LoadError::IoError(ref e) => write!(f, "{}", e),
+            LoadError::IoError(e) => write!(f, "{}", e),
         }
     }
 }

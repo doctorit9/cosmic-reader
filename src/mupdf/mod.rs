@@ -6,7 +6,7 @@ use cosmic::iced::keyboard::key::Named;
 use cosmic::iced::keyboard::{Event as KeyEvent, Key, Modifiers};
 use cosmic::iced::mouse::{self, Button, ScrollDelta};
 use cosmic::iced::widget::scrollable;
-use cosmic::iced::{Alignment, ContentFit, Length, Rectangle, Subscription, stream, window};
+use cosmic::iced::{Alignment, Length, Rectangle, Subscription, stream, window};
 use cosmic::widget::nav_bar::Model;
 use cosmic::widget::segmented_button::Entity;
 use cosmic::widget::{self};
@@ -22,22 +22,7 @@ use crate::fl;
 
 const THUMBNAIL_WIDTH: u16 = 128;
 
-fn display_list_to_inverted_image(display_list: &mupdf::DisplayList, scale: f32) -> widget::image::Handle {
-    let matrix = mupdf::Matrix::new_scale(scale, scale);
-    let mut pixmap = display_list
-        .to_pixmap(&matrix, &mupdf::Colorspace::device_rgb(), false)
-        .unwrap();
-    let samples = pixmap.samples_mut();
-    // Invert RGB channels, keep alpha
-    for chunk in samples.chunks_exact_mut(4) {
-        chunk[0] = 255 - chunk[0];
-        chunk[1] = 255 - chunk[1];
-        chunk[2] = 255 - chunk[2];
-    }
-    let mut data = Vec::new();
-    pixmap.write_to(&mut data, mupdf::ImageFormat::PNG).unwrap();
-    widget::image::Handle::from_bytes(data)
-}
+
 
 fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
@@ -98,16 +83,24 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-//TODO: return errors
-fn display_list_to_image(display_list: &mupdf::DisplayList, scale: f32) -> widget::image::Handle {
+fn display_list_to_raw(display_list: &mupdf::DisplayList, scale: f32) -> (widget::image::Handle, widget::image::Handle) {
     let matrix = mupdf::Matrix::new_scale(scale, scale);
-    let pixmap = display_list
-        .to_pixmap(&matrix, &mupdf::Colorspace::device_rgb(), false)
+    let mut pixmap = display_list
+        .to_pixmap(&matrix, &mupdf::Colorspace::device_rgb(), true)
         .unwrap();
-    let mut data = Vec::new();
-    //TODO: store raw image data?
-    pixmap.write_to(&mut data, mupdf::ImageFormat::PNG).unwrap();
-    widget::image::Handle::from_bytes(data)
+    let w = pixmap.width();
+    let h = pixmap.height();
+    let normal = widget::image::Handle::from_rgba(w, h, pixmap.samples().to_vec());
+    {
+        let samples = pixmap.samples_mut();
+        for chunk in samples.chunks_exact_mut(4) {
+            chunk[0] = 255 - chunk[0];
+            chunk[1] = 255 - chunk[1];
+            chunk[2] = 255 - chunk[2];
+        }
+    }
+    let inverted = widget::image::Handle::from_rgba(w, h, pixmap.samples().to_vec());
+    (normal, inverted)
 }
 
 struct Flags {
@@ -121,8 +114,8 @@ struct Page {
     display_list: Option<Arc<mupdf::DisplayList>>,
     icon_bounds: Cell<Option<Rectangle>>,
     icon_handle: Option<widget::image::Handle>,
+    image_handle: Option<widget::image::Handle>,
     inverted_image_handle: Option<widget::image::Handle>,
-    svg_handle: Option<widget::svg::Handle>,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +127,7 @@ enum Message {
     FileOpen,
     Fullscreen,
     Key(Modifiers, Key, Option<SmolStr>),
+    LoadError(String),
     MiddleDragRelease,
     MiddleDragStart(cosmic::iced::Point),
     MiddleDragMove(cosmic::iced::Point),
@@ -141,6 +135,7 @@ enum Message {
     NavScroll(scrollable::Viewport),
     NavSelect(Entity),
     NaturalScrollToggle,
+    PageRendered(Entity, widget::image::Handle, widget::image::Handle),
     PageScroll(ScrollDelta),
     Pages(Vec<Page>),
     PdfBackgroundChange(usize),
@@ -149,7 +144,6 @@ enum Message {
     SearchClear,
     SearchInput(String),
     SearchResults(Entity, Vec<mupdf::Quad>),
-    Svg(Entity, widget::svg::Handle, widget::image::Handle),
     Thumbnail(Entity, widget::image::Handle),
     ZoomDropdown(usize),
     ZoomScroll(ScrollDelta),
@@ -161,7 +155,6 @@ enum PdfBackground {
     Dark,
     Light,
     White,
-    Custom { r: u8, g: u8, b: u8 },
 }
 
 impl PdfBackground {
@@ -177,9 +170,6 @@ impl PdfBackground {
             PdfBackground::Dark => cosmic::iced::Color::from_rgb(0.1, 0.1, 0.1),
             PdfBackground::Light => cosmic::iced::Color::from_rgb(1.0, 1.0, 1.0),
             PdfBackground::White => cosmic::iced::Color::from_rgb(1.0, 1.0, 1.0),
-            PdfBackground::Custom { r, g, b } => {
-                cosmic::iced::Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
-            }
         }
     }
 
@@ -201,19 +191,7 @@ impl PdfBackground {
         ]
     }
 
-    fn resolve(&self, is_dark: bool) -> Self {
-        match self {
-            PdfBackground::SystemTheme => {
-                if is_dark {
-                    PdfBackground::Dark
-                } else {
-                    PdfBackground::Light
-                }
-            }
-            other => *other,
-        }
     }
-}
 
 impl fmt::Display for PdfBackground {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -222,7 +200,6 @@ impl fmt::Display for PdfBackground {
             PdfBackground::Dark => write!(f, "Dark"),
             PdfBackground::Light => write!(f, "Light"),
             PdfBackground::White => write!(f, "White"),
-            PdfBackground::Custom { .. } => write!(f, "Custom"),
         }
     }
 }
@@ -295,6 +272,7 @@ struct App {
     core: Core,
     flags: Flags,
     fullscreen: bool,
+    load_error: Option<String>,
     middle_drag_pos: Option<cosmic::iced::Point>,
     modifiers: Modifiers,
     natural_scroll: bool,
@@ -434,24 +412,20 @@ impl App {
                 }
             }
         }
-        if page.svg_handle.is_none()
+        if page.image_handle.is_none()
             && let Some(display_list) = page.display_list.clone()
         {
             tasks.push(Task::perform(
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        let svg = display_list.to_svg(&mupdf::Matrix::IDENTITY).unwrap();
-                        let inverted = display_list_to_inverted_image(&display_list, 2.0);
-                        Message::Svg(
-                            entity,
-                            widget::svg::Handle::from_memory(svg.into_bytes()),
-                            inverted,
-                        )
+                        display_list_to_raw(&display_list, 3.0)
                     })
                     .await
                     .unwrap()
                 },
-                action::app,
+                move |(normal, inverted)| {
+                    action::app(Message::PageRendered(entity, normal, inverted))
+                },
             ));
         }
         Task::batch(tasks)
@@ -538,6 +512,7 @@ impl Application for App {
             core,
             flags,
             fullscreen: false,
+            load_error: None,
             middle_drag_pos: None,
             modifiers: Modifiers::default(),
             natural_scroll: true,
@@ -664,12 +639,15 @@ impl Application for App {
                     tasks.push(Task::perform(
                         async move {
                             tokio::task::spawn_blocking(move || {
-                                let scale =
-                                    (THUMBNAIL_WIDTH as f32) / display_list.bounds().width();
-                                Message::Thumbnail(
-                                    entity,
-                                    display_list_to_image(&display_list, scale),
-                                )
+                                let scale = (THUMBNAIL_WIDTH as f32) / display_list.bounds().width();
+                                let matrix = mupdf::Matrix::new_scale(scale, scale);
+                                let pixmap = display_list
+                                    .to_pixmap(&matrix, &mupdf::Colorspace::device_rgb(), true)
+                                    .unwrap();
+                                let w = pixmap.width();
+                                let h = pixmap.height();
+                                let handle = widget::image::Handle::from_rgba(w, h, pixmap.samples().to_vec());
+                                Message::Thumbnail(entity, handle)
                             })
                             .await
                             .unwrap()
@@ -686,6 +664,7 @@ impl Application for App {
                 self.nav_model.clear();
                 self.flags.url_opt = Some(url);
                 self.document_meta = None;
+                self.load_error = None;
                 self.properties_open = false;
             }
             Message::FileOpen => {
@@ -727,8 +706,8 @@ impl Application for App {
             Message::MiddleDragMove(pos) => {
                 if let Some(last_pos) = self.middle_drag_pos.take() {
                     let offset = self.content_viewport.as_ref().map(|v| v.absolute_offset()).unwrap_or_default();
-                    let new_x = (offset.x as f32 + last_pos.x - pos.x).max(0.0);
-                    let new_y = (offset.y as f32 + last_pos.y - pos.y).max(0.0);
+                    let new_x = (offset.x + last_pos.x - pos.x).max(0.0);
+                    let new_y = (offset.y + last_pos.y - pos.y).max(0.0);
                     self.middle_drag_pos = Some(pos);
                     return scrollable::scroll_to(
                         self.content_scroll_id.clone(),
@@ -741,6 +720,11 @@ impl Application for App {
             }
             Message::MiddleDragRelease => {
                 self.middle_drag_pos = None;
+            }
+            Message::LoadError(msg) => {
+                self.load_error = Some(msg);
+                self.document_meta = None;
+                self.nav_model.clear();
             }
             //TODO: move to key binds and set up menu
             Message::Key(_modifiers, key, _text) => match &key {
@@ -838,10 +822,10 @@ impl Application for App {
             Message::SearchResults(_entity, _quads) => {
                 //TODO
             }
-            Message::Svg(entity, svg_handle, inverted_image_handle) => {
+            Message::PageRendered(entity, normal, inverted) => {
                 if let Some(page) = self.nav_model.data_mut::<Page>(entity) {
-                    page.svg_handle = Some(svg_handle);
-                    page.inverted_image_handle = Some(inverted_image_handle);
+                    page.image_handle = Some(normal);
+                    page.inverted_image_handle = Some(inverted);
                 }
             }
             Message::Thumbnail(entity, handle) => {
@@ -932,7 +916,7 @@ impl Application for App {
             let pdf_background = self.pdf_background;
             let zoom = self.zoom;
             let page_bounds = page.bounds;
-            let svg_handle = page.svg_handle.clone();
+            let image_handle = page.image_handle.clone();
             let inverted_image_handle = page.inverted_image_handle.clone();
             let view_ratio = self.view_ratio.clone();
             let is_dark = theme::is_dark();
@@ -961,10 +945,9 @@ impl Application for App {
                     } else {
                         Element::from(widget::space().width(width).height(height))
                     }
-                } else if let Some(handle) = &svg_handle {
+                } else if let Some(handle) = &image_handle {
                     Element::from(
-                        widget::svg(handle.clone())
-                            .content_fit(ContentFit::Fill)
+                        widget::image(handle.clone())
                             .width(width)
                             .height(height),
                     )
@@ -1063,12 +1046,37 @@ impl Application for App {
                     stream::channel(
                         16,
                         |mut output: futures::channel::mpsc::Sender<Message>| async move {
-                            //TODO: send errors to UI
                             let handle = tokio::runtime::Handle::current();
-                            tokio::task::spawn_blocking(move || {
-                                let Ok(path) = url.to_file_path() else { return };
-                                let doc = mupdf::Document::open(path.as_os_str()).unwrap();
-                                let page_count = doc.page_count().unwrap();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let path = match url.to_file_path() {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        let _ = handle.block_on(async {
+                                            output.send(Message::LoadError(format!("Invalid URL path: {:?}", e))).await
+                                        });
+                                        return;
+                                    }
+                                };
+
+                                let doc = match mupdf::Document::open(path.as_os_str()) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        let _ = handle.block_on(async {
+                                            output.send(Message::LoadError(format!("Failed to open document: {}", e))).await
+                                        });
+                                        return;
+                                    }
+                                };
+
+                                let page_count = match doc.page_count() {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        let _ = handle.block_on(async {
+                                            output.send(Message::LoadError(format!("Failed to get page count: {}", e))).await
+                                        });
+                                        return;
+                                    }
+                                };
 
                                 let file_size = std::fs::metadata(&path)
                                     .map(|m| m.len())
@@ -1094,51 +1102,95 @@ impl Application for App {
                                     file_path: path.clone(),
                                     file_size,
                                 };
-                                handle
-                                    .block_on(async {
-                                        output.send(Message::DocumentMeta(meta)).await
-                                    })
-                                    .unwrap();
+
+                                if handle.block_on(async {
+                                    output.send(Message::DocumentMeta(meta)).await
+                                }).is_err() {
+                                    log::warn!("failed to send document meta");
+                                    return;
+                                }
 
                                 // Generate the table of contents
-                                let mut pages =
-                                    Vec::with_capacity(usize::try_from(page_count).unwrap());
+                                let page_count_usize = match usize::try_from(page_count) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        let _ = handle.block_on(async {
+                                            output.send(Message::LoadError(format!("Invalid page count: {}", e))).await
+                                        });
+                                        return;
+                                    }
+                                };
+
+                                let mut pages = Vec::with_capacity(page_count_usize);
                                 for index in 0..page_count {
-                                    let page = doc.load_page(index).unwrap();
-                                    //TODO: get label?
-                                    let bounds = page.bounds().unwrap();
+                                    let page = match doc.load_page(index) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            let _ = handle.block_on(async {
+                                                output.send(Message::LoadError(format!("Failed to load page {}: {}", index, e))).await
+                                            });
+                                            return;
+                                        }
+                                    };
+                                    let bounds = match page.bounds() {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            let _ = handle.block_on(async {
+                                                output.send(Message::LoadError(format!("Failed to get bounds for page {}: {}", index, e))).await
+                                            });
+                                            return;
+                                        }
+                                    };
                                     pages.push(Page {
                                         index,
                                         bounds,
                                         display_list: None,
                                         icon_bounds: Cell::new(None),
                                         icon_handle: None,
+                                        image_handle: None,
                                         inverted_image_handle: None,
-                                        svg_handle: None,
                                     });
                                 }
-                                handle
-                                    .block_on(async { output.send(Message::Pages(pages)).await })
-                                    .unwrap();
+
+                                if handle.block_on(async { output.send(Message::Pages(pages)).await }).is_err() {
+                                    log::warn!("failed to send pages");
+                                    return;
+                                }
 
                                 // Generate display lists (cannot be threaded)
                                 for index in 0..page_count {
-                                    let page = doc.load_page(index).unwrap();
-                                    let display_list = page.to_display_list(false).unwrap();
-                                    handle
-                                        .block_on(async {
-                                            output
-                                                .send(Message::DisplayList(
-                                                    index,
-                                                    Arc::new(display_list),
-                                                ))
-                                                .await
-                                        })
-                                        .unwrap();
+                                    let page = match doc.load_page(index) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            let _ = handle.block_on(async {
+                                                output.send(Message::LoadError(format!("Failed to load page {}: {}", index, e))).await
+                                            });
+                                            return;
+                                        }
+                                    };
+                                    let display_list = match page.to_display_list(false) {
+                                        Ok(dl) => dl,
+                                        Err(e) => {
+                                            let _ = handle.block_on(async {
+                                                output.send(Message::LoadError(format!("Failed to create display list for page {}: {}", index, e))).await
+                                            });
+                                            return;
+                                        }
+                                    };
+                                    if handle.block_on(async {
+                                        output
+                                            .send(Message::DisplayList(
+                                                index,
+                                                Arc::new(display_list),
+                                            ))
+                                            .await
+                                    }).is_err() {
+                                        log::warn!("failed to send display list for page {}", index);
+                                        return;
+                                    }
                                 }
                             })
-                            .await
-                            .unwrap();
+                            .await;
                             std::future::pending().await
                         },
                     )
